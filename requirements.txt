@@ -2,3 +2,5 @@ streamlit
 pandas
 numpy
 yfinance
+lxml
+html5lib
