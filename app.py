@@ -3,216 +3,180 @@ import pandas as pd
 import yfinance as yf
 import streamlit as st
 
-# ---------------------------
-# Streamlit page config
-# ---------------------------
-st.set_page_config(page_title="ETF BI Dashboard (ProShares-style)", layout="wide")
+st.set_page_config(page_title="Simple ETF BI Dashboard", layout="wide")
+st.title("Simple ETF BI Dashboard (ProShares-style)")
+st.caption("Answers: performance, risk, estimated fee revenue, and daily-reset leverage effect.")
 
-st.title("ETF BI Dashboard (AUM • Revenue • Risk • Leveraged Decay)")
-st.caption("Portfolio-style BI project: KPI table + performance/risk + daily reset simulation (educational).")
+# -------------------------
+# 1) Pick tickers (simple)
+# -------------------------
+st.sidebar.header("Settings")
 
-# ---------------------------
-# Sidebar controls
-# ---------------------------
-st.sidebar.header("Controls")
+default = "SPY, QQQ, TLT, SSO, SH"  # SPY/QQQ/TLT + ProShares examples (SSO, SH)
+tickers = st.sidebar.text_input("Tickers (comma-separated)", default)
+tickers = [t.strip().upper() for t in tickers.split(",") if t.strip()]
 
-default_tickers = ["SPY", "QQQ", "TLT", "SSO", "SH"]  # includes ProShares examples
-tickers_input = st.sidebar.text_input(
-    "Tickers (comma-separated)",
-    value=",".join(default_tickers)
-)
-tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+benchmark = st.sidebar.selectbox("Benchmark", tickers, index=0)
+start = st.sidebar.date_input("Start date", value=pd.to_datetime("2021-01-01"))
+end = st.sidebar.date_input("End date", value=pd.to_datetime("today"))
 
-benchmark_ticker = st.sidebar.selectbox("Benchmark ticker", options=tickers, index=0)
+# -------------------------
+# 2) Simple AUM + fee assumptions
+# -------------------------
+st.sidebar.header("AUM & Expense Ratio (simple inputs)")
+st.sidebar.caption("These are estimates for the BI model. You can edit anytime.")
 
-start_date = st.sidebar.date_input("Start date", value=pd.to_datetime("2021-01-01"))
-end_date = st.sidebar.date_input("End date", value=pd.to_datetime("today"))
-
-st.sidebar.subheader("Leveraged / Inverse Simulation")
-lev_long = st.sidebar.slider("Leverage (long)", min_value=1.0, max_value=3.0, value=2.0, step=0.5)
-lev_inv = st.sidebar.slider("Leverage (inverse)", min_value=-3.0, max_value=-1.0, value=-1.0, step=0.5)
-
-st.sidebar.subheader("AUM + Fees (you can edit)")
-st.sidebar.caption("These are placeholders for BI modeling. You can update to real values later.")
-
-# Default placeholder AUM + expense ratios (you can change)
-DEFAULT_META = {
-    "SPY": {"name": "S&P 500", "expense_ratio": 0.0009, "aum": 500e9},
-    "QQQ": {"name": "Nasdaq 100", "expense_ratio": 0.0020, "aum": 250e9},
-    "TLT": {"name": "20Y+ Treasuries", "expense_ratio": 0.0015, "aum": 40e9},
-    "SSO": {"name": "ProShares Ultra S&P500 (2x)", "expense_ratio": 0.0091, "aum": 2e9},
-    "SH":  {"name": "ProShares Short S&P500 (-1x)", "expense_ratio": 0.0089, "aum": 3e9},
+# Simple default assumptions (you can change)
+defaults = {
+    "SPY": (500e9, 0.0009),
+    "QQQ": (250e9, 0.0020),
+    "TLT": (40e9, 0.0015),
+    "SSO": (2e9, 0.0091),
+    "SH":  (3e9, 0.0089),
 }
 
-# Let user override AUM/fee quickly for the selected tickers
-meta = {}
+aum = {}
+fee = {}
 for t in tickers:
-    base = DEFAULT_META.get(t, {"name": t, "expense_ratio": 0.0050, "aum": 1e9})
-    st.sidebar.markdown(f"**{t}**")
-    name = st.sidebar.text_input(f"{t} name", value=base["name"], key=f"name_{t}")
-    exp = st.sidebar.number_input(f"{t} expense ratio (decimal)", value=float(base["expense_ratio"]), step=0.0001, format="%.4f", key=f"exp_{t}")
-    aum = st.sidebar.number_input(f"{t} AUM (USD)", value=float(base["aum"]), step=1e8, format="%.0f", key=f"aum_{t}")
-    meta[t] = {"ticker": t, "name": name, "expense_ratio": exp, "aum": aum}
+    a0, f0 = defaults.get(t, (1e9, 0.0050))
+    aum[t] = st.sidebar.number_input(f"{t} AUM ($)", value=float(a0), step=1e8, format="%.0f")
+    fee[t] = st.sidebar.number_input(f"{t} Expense Ratio (decimal)", value=float(f0), step=0.0001, format="%.4f")
 
-# ---------------------------
+# -------------------------
 # Helpers
-# ---------------------------
+# -------------------------
 @st.cache_data(show_spinner=False)
-def fetch_adj_close(tickers_list, start, end) -> pd.DataFrame:
-    data = yf.download(tickers_list, start=start, end=end, progress=False, auto_adjust=False)
+def get_prices(tickers, start, end):
+    data = yf.download(tickers, start=start, end=end, progress=False)
     if data.empty:
         return pd.DataFrame()
-    if isinstance(data.columns, pd.MultiIndex):
-        prices = data["Adj Close"].copy()
-    else:
-        prices = data[["Adj Close"]].copy()
-        prices.columns = tickers_list
+    prices = data["Adj Close"] if isinstance(data.columns, pd.MultiIndex) else data[["Adj Close"]]
+    if not isinstance(prices, pd.DataFrame):
+        prices = prices.to_frame()
     prices = prices.dropna(how="all")
     return prices
 
-def daily_returns(prices: pd.DataFrame) -> pd.DataFrame:
-    return prices.pct_change().dropna(how="all")
+def calc_metrics(prices, benchmark_ticker):
+    rets = prices.pct_change().dropna()
+    growth = (1 + rets).cumprod() * 100
 
-def cumulative_return(rets: pd.DataFrame) -> pd.Series:
-    return (1 + rets).prod() - 1
+    # Performance (total return)
+    total_return = (growth.iloc[-1] / growth.iloc[0]) - 1
 
-def annualized_volatility(rets: pd.DataFrame, trading_days=252) -> pd.Series:
-    return rets.std() * np.sqrt(trading_days)
+    # Risk (annualized volatility)
+    vol = rets.std() * np.sqrt(252)
 
-def max_drawdown(prices: pd.DataFrame) -> pd.Series:
+    # Max drawdown
     peak = prices.cummax()
-    dd = prices / peak - 1.0
-    return dd.min()
+    dd = prices / peak - 1
+    mdd = dd.min()
 
-def tracking_error(etf_ret: pd.Series, bench_ret: pd.Series, trading_days=252) -> float:
-    diff = (etf_ret - bench_ret).dropna()
-    if diff.empty:
-        return float("nan")
-    return float(diff.std() * np.sqrt(trading_days))
+    # Tracking error vs benchmark
+    bench = rets[benchmark_ticker]
+    te = {}
+    for c in rets.columns:
+        diff = (rets[c] - bench).dropna()
+        te[c] = float(diff.std() * np.sqrt(252)) if len(diff) else np.nan
+    te = pd.Series(te)
 
-def simulate_daily_reset(bench_returns: pd.Series, leverage: float, start_value: float = 100.0) -> pd.Series:
+    return rets, growth, total_return, vol, mdd, te
+
+def simulate_daily_reset(bench_returns, leverage, start_value=100):
     vals = [start_value]
-    idx = bench_returns.dropna().index
     for r in bench_returns.dropna():
         vals.append(vals[-1] * (1 + leverage * r))
-    return pd.Series(vals[1:], index=idx)
+    return pd.Series(vals[1:], index=bench_returns.dropna().index)
 
-def build_summary(prices: pd.DataFrame, meta_dict: dict, bench_ticker: str) -> pd.DataFrame:
-    rets = daily_returns(prices)
-    bench = rets[bench_ticker]
-
-    cum = cumulative_return(rets)
-    vol = annualized_volatility(rets)
-    mdd = max_drawdown(prices)
-
-    rows = []
-    for t, m in meta_dict.items():
-        if t not in prices.columns:
-            continue
-
-        te = 0.0 if t == bench_ticker else tracking_error(rets[t], bench)
-        fee_rev = m["aum"] * m["expense_ratio"]
-
-        rows.append({
-            "Ticker": t,
-            "Name": m["name"],
-            "AUM ($)": m["aum"],
-            "Expense Ratio": m["expense_ratio"],
-            "Est. Annual Fee Revenue ($)": fee_rev,
-            "Cumulative Return": float(cum.get(t, np.nan)),
-            "Annualized Volatility": float(vol.get(t, np.nan)),
-            "Max Drawdown": float(mdd.get(t, np.nan)),
-            f"Tracking Error vs {bench_ticker}": float(te),
-        })
-
-    out = pd.DataFrame(rows).sort_values("AUM ($)", ascending=False)
-    return out
-
-# ---------------------------
-# Load data
-# ---------------------------
-with st.spinner("Downloading ETF price history..."):
-    prices = fetch_adj_close(tickers, start_date, end_date)
+# -------------------------
+# 3) Load data
+# -------------------------
+with st.spinner("Downloading price data..."):
+    prices = get_prices(tickers, start, end)
 
 if prices.empty:
-    st.error("No price data returned. Check tickers or date range.")
+    st.error("No data returned. Check tickers or date range.")
     st.stop()
 
-# Align columns to requested tickers order (if possible)
+# Make sure all tickers exist
 prices = prices[[c for c in tickers if c in prices.columns]]
 
-rets = daily_returns(prices)
-growth_100 = (1 + rets).cumprod() * 100
+rets, growth, total_return, vol, mdd, te = calc_metrics(prices, benchmark)
 
-# ---------------------------
-# Executive KPIs (top cards)
-# ---------------------------
-summary_df = build_summary(prices, meta, benchmark_ticker)
+# -------------------------
+# 4) Executive summary table (answers the key questions)
+# -------------------------
+summary = pd.DataFrame({
+    "AUM ($)": pd.Series({t: aum[t] for t in prices.columns}),
+    "Expense Ratio": pd.Series({t: fee[t] for t in prices.columns}),
+    "Est. Fee Revenue ($/yr)": pd.Series({t: aum[t] * fee[t] for t in prices.columns}),
+    "Total Return": total_return,
+    "Volatility (ann.)": vol,
+    "Max Drawdown": mdd,
+    f"Tracking Error vs {benchmark}": te
+}).reset_index().rename(columns={"index": "Ticker"})
 
-col1, col2, col3, col4 = st.columns(4)
-total_aum = summary_df["AUM ($)"].sum()
-total_fee_rev = summary_df["Est. Annual Fee Revenue ($)"].sum()
+# Rank-style “answer” columns
+best_perf = summary.sort_values("Total Return", ascending=False).iloc[0]
+most_risk = summary.sort_values("Volatility (ann.)", ascending=False).iloc[0]
+most_rev = summary.sort_values("Est. Fee Revenue ($/yr)", ascending=False).iloc[0]
 
-col1.metric("Tickers", len(prices.columns))
-col2.metric("Total AUM (model)", f"${total_aum:,.0f}")
-col3.metric("Est. Annual Fee Revenue (model)", f"${total_fee_rev:,.0f}")
-col4.metric("Benchmark", benchmark_ticker)
-
-st.divider()
-
-# ---------------------------
-# Main layout
-# ---------------------------
-left, right = st.columns([1.1, 0.9])
-
-with left:
-    st.subheader("Executive Summary Table")
-    fmt = summary_df.copy()
-    # Friendly formatting
-    money_cols = ["AUM ($)", "Est. Annual Fee Revenue ($)"]
-    for c in money_cols:
-        fmt[c] = fmt[c].map(lambda x: f"${x:,.0f}")
-    fmt["Expense Ratio"] = fmt["Expense Ratio"].map(lambda x: f"{x:.4f}")
-    fmt["Cumulative Return"] = fmt["Cumulative Return"].map(lambda x: f"{x:.2%}")
-    fmt["Annualized Volatility"] = fmt["Annualized Volatility"].map(lambda x: f"{x:.2%}")
-    fmt["Max Drawdown"] = fmt["Max Drawdown"].map(lambda x: f"{x:.2%}")
-    te_col = f"Tracking Error vs {benchmark_ticker}"
-    fmt[te_col] = fmt[te_col].map(lambda x: f"{x:.2%}" if pd.notna(x) else "NA")
-
-    st.dataframe(fmt, use_container_width=True)
-
-    st.subheader("Growth of $100 (Adjusted Close)")
-    st.line_chart(growth_100, use_container_width=True)
-
-with right:
-    st.subheader("Daily Reset Simulation (Volatility Decay Illustration)")
-    bench_series = rets[benchmark_ticker].dropna()
-
-    sim_long = simulate_daily_reset(bench_series, leverage=lev_long, start_value=100)
-    sim_inv = simulate_daily_reset(bench_series, leverage=lev_inv, start_value=100)
-
-    # Align benchmark growth to sim index
-    bench_growth = growth_100[benchmark_ticker].reindex(sim_long.index).dropna()
-
-    sim_df = pd.DataFrame({
-        f"Simulated {lev_long}x Daily Reset": sim_long.reindex(bench_growth.index),
-        f"Simulated {lev_inv}x Daily Reset": sim_inv.reindex(bench_growth.index),
-        f"{benchmark_ticker} Benchmark": bench_growth
-    }).dropna()
-
-    st.line_chart(sim_df, use_container_width=True)
-
-    st.markdown("**What to say in the interview:**")
-    st.write(
-        "“This panel shows daily reset compounding. In volatile markets, leveraged/inverse products can drift away from "
-        "simple long-term expectations, which is why they’re typically positioned for short-term tactical use.”"
-    )
+# -------------------------
+# 5) Top answers (super simple)
+# -------------------------
+st.subheader("Key Answers (what matters)")
+c1, c2, c3 = st.columns(3)
+c1.metric("Best performance", f"{best_perf['Ticker']} ({best_perf['Total Return']:.1%})")
+c2.metric("Highest risk (volatility)", f"{most_risk['Ticker']} ({most_risk['Volatility (ann.)']:.1%})")
+c3.metric("Highest fee revenue (model)", f"{most_rev['Ticker']} (${most_rev['Est. Fee Revenue ($/yr)']:,.0f}/yr)")
 
 st.divider()
 
-# ---------------------------
-# Quick download
-# ---------------------------
-st.subheader("Download Summary")
-csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
-st.download_button("Download summary.csv", data=csv_bytes, file_name="summary.csv", mime="text/csv")
+# -------------------------
+# 6) Simple table + chart
+# -------------------------
+st.subheader("Executive Summary Table")
+show = summary.copy()
+show["AUM ($)"] = show["AUM ($)"].map(lambda x: f"${x:,.0f}")
+show["Est. Fee Revenue ($/yr)"] = show["Est. Fee Revenue ($/yr)"].map(lambda x: f"${x:,.0f}")
+show["Expense Ratio"] = show["Expense Ratio"].map(lambda x: f"{x:.4f}")
+show["Total Return"] = show["Total Return"].map(lambda x: f"{x:.2%}")
+show["Volatility (ann.)"] = show["Volatility (ann.)"].map(lambda x: f"{x:.2%}")
+show["Max Drawdown"] = show["Max Drawdown"].map(lambda x: f"{x:.2%}")
+show[f"Tracking Error vs {benchmark}"] = show[f"Tracking Error vs {benchmark}"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "NA")
+st.dataframe(show, use_container_width=True)
+
+st.subheader("Growth of $100")
+st.line_chart(growth, use_container_width=True)
+
+st.divider()
+
+# -------------------------
+# 7) Simple daily reset simulation (one chart, one message)
+# -------------------------
+st.subheader("Daily Reset (why leverage can decay)")
+lev = st.slider("Leverage for simulation (uses benchmark daily returns)", -3.0, 3.0, 2.0, 0.5)
+
+bench_rets = rets[benchmark]
+sim = simulate_daily_reset(bench_rets, leverage=lev, start_value=100)
+
+compare = pd.DataFrame({
+    f"Simulated {lev}x (Daily Reset)": sim,
+    f"{benchmark} Benchmark": growth[benchmark].reindex(sim.index)
+}).dropna()
+
+st.line_chart(compare, use_container_width=True)
+
+st.info(
+    "Why this matters: leveraged/inverse ETFs target DAILY returns. Over time, compounding in volatile markets can make "
+    "performance drift from what people expect long-term. This is the key 'daily reset / decay' concept."
+)
+
+# -------------------------
+# 8) Download summary
+# -------------------------
+st.download_button(
+    "Download summary as CSV",
+    data=summary.to_csv(index=False).encode("utf-8"),
+    file_name="etf_summary.csv",
+    mime="text/csv"
+)
