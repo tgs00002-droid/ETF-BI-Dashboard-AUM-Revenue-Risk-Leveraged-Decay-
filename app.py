@@ -6,30 +6,27 @@ import streamlit as st
 # ----------------------------
 # Page setup
 # ----------------------------
-st.set_page_config(page_title="Simple ETF Dashboard", layout="wide")
-st.title("Simple ETF Dashboard (Performance • Risk • Drawdown • Daily Reset)")
-
+st.set_page_config(page_title="ProShares ETF Dashboard", layout="wide")
+st.title("ProShares ETF Dashboard (Performance • Risk • Drawdown • Daily Reset)")
 st.caption(
-    "Uses real adjusted close prices. Answers: best performer, riskiest, worst drawdown, "
-    "and a simple daily-reset leverage illustration."
+    "Uses real adjusted close prices for ProShares tickers only. "
+    "Answers: best performer, riskiest, worst drawdown, and a simple daily-reset illustration."
 )
 
 # ----------------------------
-# Controls (minimal)
+# Minimal controls
 # ----------------------------
-# Keep it simple: only date range.
 colA, colB = st.columns(2)
 with colA:
-    start = st.date_input("Start date", value=pd.to_datetime("2023-01-01"))
+    start = st.date_input("Start date", value=pd.to_datetime("2020-01-01"))
 with colB:
     end = st.date_input("End date", value=pd.to_datetime("today"))
 
-# Fixed tickers (simple + relevant)
-# SPY benchmark + ProShares examples + Nasdaq for variety
-TICKERS = ["SPY", "QQQ", "SSO", "SH", "TLT"]  # ProShares: SSO (2x), SH (-1x)
-BENCH = "SPY"
+# ProShares-only universe (coherent set)
+TICKERS = ["NOBL", "SSO", "UPRO", "SH", "SDS", "SPXU"]
+BENCH = "NOBL"  # ProShares benchmark-like equity ETF
 
-st.write(f"**Tracking:** {', '.join(TICKERS)}  |  **Benchmark:** {BENCH}")
+st.write(f"**Tickers:** {', '.join(TICKERS)}  |  **Benchmark (ProShares):** {BENCH}")
 
 # ----------------------------
 # Data fetch
@@ -42,7 +39,6 @@ def fetch_prices(tickers, start_date, end_date) -> pd.DataFrame:
     if isinstance(data.columns, pd.MultiIndex):
         prices = data["Adj Close"].copy()
     else:
-        # single ticker case
         prices = data[["Adj Close"]].copy()
         prices.columns = tickers
     prices = prices.dropna(how="all")
@@ -51,20 +47,23 @@ def fetch_prices(tickers, start_date, end_date) -> pd.DataFrame:
 with st.spinner("Downloading price data..."):
     prices = fetch_prices(TICKERS, start, end)
 
-if prices.empty or prices.shape[0] < 5:
-    st.error("Not enough data returned. Try a wider date range.")
+if prices.empty or prices.shape[0] < 10:
+    st.error("Not enough data returned. Try a wider date range (example: 2020-01-01 to today).")
     st.stop()
 
-# Ensure order and remove missing columns (if any ticker fails)
-prices = prices[[t for t in TICKERS if t in prices.columns]].dropna(how="all")
+# Keep only tickers that actually returned data
+available = [t for t in TICKERS if t in prices.columns and prices[t].notna().sum() > 10]
+prices = prices[available].dropna(how="all")
+
+if BENCH not in prices.columns:
+    st.error(f"Benchmark {BENCH} has no data in this date range. Try a wider range.")
+    st.stop()
+
 rets = prices.pct_change().dropna()
 
 # ----------------------------
-# Metrics (real)
+# Metrics
 # ----------------------------
-def total_return(series: pd.Series) -> float:
-    return float(series.iloc[-1] / series.iloc[0] - 1)
-
 def annual_volatility(ret_series: pd.Series) -> float:
     return float(ret_series.std() * np.sqrt(252))
 
@@ -77,21 +76,20 @@ growth_100 = (1 + rets).cumprod() * 100
 
 metrics = []
 for t in prices.columns:
-    metrics.append({
-        "Ticker": t,
-        "Total Return": total_return(growth_100[t]),
-        "Volatility (ann.)": annual_volatility(rets[t]),
-        "Max Drawdown": max_drawdown(prices[t]),
-    })
+    total_ret = float(growth_100[t].iloc[-1] / growth_100[t].iloc[0] - 1)
+    vol = annual_volatility(rets[t])
+    mdd = max_drawdown(prices[t])
+    metrics.append({"Ticker": t, "Total Return": total_ret, "Volatility (ann.)": vol, "Max Drawdown": mdd})
+
 metrics_df = pd.DataFrame(metrics)
 
-# "Answers"
+# Key answers
 best = metrics_df.sort_values("Total Return", ascending=False).iloc[0]
 risk = metrics_df.sort_values("Volatility (ann.)", ascending=False).iloc[0]
-worst_dd = metrics_df.sort_values("Max Drawdown").iloc[0]  # most negative = worst
+worst_dd = metrics_df.sort_values("Max Drawdown").iloc[0]  # most negative
 
 # ----------------------------
-# Top answers (clean)
+# Key answers (clean)
 # ----------------------------
 st.subheader("Key Answers")
 c1, c2, c3 = st.columns(3)
@@ -102,7 +100,7 @@ c3.metric("Worst drawdown", f"{worst_dd['Ticker']}", f"{worst_dd['Max Drawdown']
 st.divider()
 
 # ----------------------------
-# Simple table (no clutter)
+# Simple table
 # ----------------------------
 st.subheader("Summary Table")
 show = metrics_df.copy()
@@ -114,15 +112,14 @@ st.dataframe(show, use_container_width=True, hide_index=True)
 # ----------------------------
 # Graph 1: Growth of $100
 # ----------------------------
-st.subheader("Growth of $100 (Real prices)")
+st.subheader("Growth of $100 (ProShares tickers)")
 st.line_chart(growth_100, use_container_width=True)
 
 st.divider()
 
 # ----------------------------
-# Daily reset illustration (simple + clear)
-# Uses benchmark returns to simulate what 2x and -1x *would* do with daily reset.
-# This illustrates the concept without extra controls.
+# Daily reset illustration (simple)
+# Use benchmark daily returns to simulate what 2x and -1x daily-reset returns would look like
 # ----------------------------
 st.subheader("Daily Reset Illustration (Benchmark vs 2x vs -1x)")
 
@@ -147,8 +144,8 @@ compare = pd.DataFrame({
 st.line_chart(compare, use_container_width=True)
 
 st.info(
-    "What this shows: leveraged/inverse targets are DAILY. Over longer, volatile periods, compounding can make results "
-    "drift from what people expect if they think in long-term multiples. That’s the key 'daily reset' concept."
+    "What this means (simple): leveraged/inverse ETFs target DAILY returns. "
+    "Over time, compounding can create drift, especially when markets bounce around."
 )
 
 # ----------------------------
@@ -157,6 +154,6 @@ st.info(
 st.download_button(
     "Download metrics CSV",
     data=metrics_df.to_csv(index=False).encode("utf-8"),
-    file_name="etf_metrics.csv",
+    file_name="proshares_metrics.csv",
     mime="text/csv",
 )
