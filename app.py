@@ -5,29 +5,44 @@ import streamlit as st
 import yfinance as yf
 from io import StringIO
 
-st.set_page_config(page_title="ProShares Single Stock Dashboard", layout="wide")
-st.title("ProShares Single Stock ETF Dashboard (Simple + Price/NAV)")
-st.caption(
-    "Uses ProShares screener tables (Single Stock + Price/NAV) and real price history "
-    "to answer: premium/discount vs NAV + performance/risk."
+# -----------------------------
+# CONFIG
+# -----------------------------
+URL_SINGLE_STOCK = (
+    "https://www.proshares.com/our-etfs/find-leveraged-and-inverse-etfs"
+    "?etftype=&strategy=Single+Stock&benchmark=&product=Product+Overview+&search="
 )
 
-# Minimal controls: only date range
+URL_PRICE_NAV = (
+    "https://www.proshares.com/our-etfs/find-leveraged-and-inverse-etfs"
+    "?etftype=&strategy=&benchmark=&product=Price%2FNAV&search="
+)
+
+TOP_N = 12  # keep charts readable and fast
+
+
+# -----------------------------
+# STREAMLIT PAGE
+# -----------------------------
+st.set_page_config(page_title="ProShares Single Stock BI Dashboard", layout="wide")
+st.title("ProShares Single Stock BI Dashboard")
+st.caption(
+    "ProShares source tables (Single Stock + Price/NAV) + real price history to answer key BI questions."
+)
+
+# Only control: date range for performance section
 c1, c2 = st.columns(2)
 with c1:
-    start = st.date_input("Start date", value=pd.to_datetime("2024-01-01"))
+    start = st.date_input("Performance start date", value=pd.to_datetime("2024-01-01"))
 with c2:
-    end = st.date_input("End date", value=pd.to_datetime("today"))
-
-# Your ProShares links
-URL_SINGLE_STOCK = "https://www.proshares.com/our-etfs/find-leveraged-and-inverse-etfs?etftype=&strategy=Single+Stock&benchmark=&product=Product+Overview+&search="
-URL_PRICE_NAV    = "https://www.proshares.com/our-etfs/find-leveraged-and-inverse-etfs?etftype=&strategy=&benchmark=&product=Price%2FNAV&search="
-
-TOP_N = 10  # keep charts readable
+    end = st.date_input("Performance end date", value=pd.to_datetime("today"))
 
 
+# -----------------------------
+# HELPERS
+# -----------------------------
 def _get_html(url: str) -> str:
-    """Fetch HTML with headers so Streamlit Cloud doesn’t get blocked."""
+    # Streamlit Cloud often blocks bare requests. This header fixes it.
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -40,14 +55,24 @@ def _get_html(url: str) -> str:
     return r.text
 
 
+def _to_number(x):
+    # handles "$266.56", "$-0.23 (-0.09%)", "0.08%", etc.
+    s = str(x)
+    s = s.replace("$", "").replace(",", "").strip()
+    # keep only first token that looks like a number
+    token = s.split()[0] if len(s.split()) else s
+    token = token.replace("%", "")
+    return pd.to_numeric(token, errors="coerce")
+
+
 @st.cache_data(show_spinner=False)
-def load_single_stock_table(url: str) -> pd.DataFrame:
-    html = _get_html(url)
+def load_single_stock_funds() -> pd.DataFrame:
+    html = _get_html(URL_SINGLE_STOCK)
     tables = pd.read_html(StringIO(html))
     if not tables:
         return pd.DataFrame()
 
-    # Find a table containing these columns
+    # Find Product Overview table (has these columns)
     target = None
     for t in tables:
         cols = [str(c).strip() for c in t.columns]
@@ -57,25 +82,18 @@ def load_single_stock_table(url: str) -> pd.DataFrame:
     if target is None:
         return pd.DataFrame()
 
-    # Filter to Single Stock
     target["Fund Type"] = target["Fund Type"].astype(str).str.strip()
     df = target[target["Fund Type"].str.lower() == "single stock"].copy()
 
-    # Clean net assets if present
+    # Net Assets numeric for ranking
     if "Net Assets" in df.columns:
-        df["Net Assets Numeric"] = (
-            df["Net Assets"].astype(str)
-            .str.replace("$", "", regex=False)
-            .str.replace(",", "", regex=False)
-        )
-        df["Net Assets Numeric"] = pd.to_numeric(df["Net Assets Numeric"], errors="coerce")
+        df["Net Assets Numeric"] = df["Net Assets"].map(_to_number)
     else:
         df["Net Assets Numeric"] = np.nan
 
-    keep_cols = [c for c in ["Ticker", "Fund Name", "Daily Objective", "Net Assets", "Net Assets Numeric", "Index/Benchmark"] if c in df.columns]
-    df = df[keep_cols].dropna(subset=["Ticker"]).reset_index(drop=True)
+    keep = [c for c in ["Ticker", "Fund Name", "Daily Objective", "Net Assets", "Net Assets Numeric", "Index/Benchmark"] if c in df.columns]
+    df = df[keep].dropna(subset=["Ticker"]).reset_index(drop=True)
 
-    # sort by net assets if available
     if df["Net Assets Numeric"].notna().any():
         df = df.sort_values("Net Assets Numeric", ascending=False).reset_index(drop=True)
 
@@ -83,29 +101,26 @@ def load_single_stock_table(url: str) -> pd.DataFrame:
 
 
 @st.cache_data(show_spinner=False)
-def load_price_nav_table(url: str) -> pd.DataFrame:
-    """
-    Parse the ProShares Price/NAV table.
-    The exact column names can vary (Market Price vs NAV month-end/quarter-end),
-    so we search for a table that includes 'Ticker' plus some NAV/Price columns.
-    """
-    html = _get_html(url)
+def load_price_nav_snapshot() -> pd.DataFrame:
+    html = _get_html(URL_PRICE_NAV)
     tables = pd.read_html(StringIO(html))
     if not tables:
         return pd.DataFrame()
 
-    candidate = None
+    # Find the table that contains Premium / Discount
+    target = None
     for t in tables:
         cols = [str(c).strip().lower() for c in t.columns]
-        if "ticker" in cols and (any("nav" in c for c in cols) or any("market" in c for c in cols) or any("price" in c for c in cols)):
-            candidate = t.copy()
+        if "ticker" in cols and any("premium" in c for c in cols) and any("nav" in c for c in cols):
+            target = t.copy()
             break
 
-    if candidate is None:
+    if target is None:
         return pd.DataFrame()
 
-    candidate.columns = [str(c).strip() for c in candidate.columns]
-    return candidate
+    # Normalize column names
+    target.columns = [str(c).strip() for c in target.columns]
+    return target
 
 
 @st.cache_data(show_spinner=False)
@@ -113,134 +128,136 @@ def fetch_prices(tickers, start_date, end_date) -> pd.DataFrame:
     data = yf.download(tickers, start=start_date, end=end_date, progress=False, auto_adjust=False)
     if data.empty:
         return pd.DataFrame()
+
     if isinstance(data.columns, pd.MultiIndex):
         prices = data["Adj Close"].copy()
     else:
         prices = data[["Adj Close"]].copy()
         prices.columns = tickers
+
     return prices.dropna(how="all")
 
 
-def annual_volatility(ret_series: pd.Series) -> float:
-    return float(ret_series.std() * np.sqrt(252))
+def annual_vol(ret: pd.Series) -> float:
+    return float(ret.std() * np.sqrt(252))
 
 
-def max_drawdown(price_series: pd.Series) -> float:
-    peak = price_series.cummax()
-    dd = price_series / peak - 1.0
+def max_drawdown(px: pd.Series) -> float:
+    peak = px.cummax()
+    dd = px / peak - 1.0
     return float(dd.min())
 
 
-# ----------------------------
-# Load ProShares tables
-# ----------------------------
+# -----------------------------
+# LOAD DATA
+# -----------------------------
 with st.spinner("Loading ProShares Single Stock list..."):
-    single_stock = load_single_stock_table(URL_SINGLE_STOCK)
+    single_stock = load_single_stock_funds()
 
 if single_stock.empty:
-    st.error("Could not load the ProShares Single Stock table.")
+    st.error("Could not load Single Stock table from ProShares. (Site layout or access blocked.)")
     st.stop()
 
-with st.spinner("Loading ProShares Price/NAV table..."):
-    price_nav = load_price_nav_table(URL_PRICE_NAV)
-
-if price_nav.empty:
-    st.warning("Loaded Single Stock table, but could not parse Price/NAV table (site layout may have changed).")
-
-# pick top tickers from ProShares single stock list
 tickers = single_stock["Ticker"].head(TOP_N).astype(str).str.strip().tolist()
 
-st.subheader("1) ProShares Single Stock ETFs (source table)")
+with st.spinner("Loading ProShares Price/NAV snapshot..."):
+    price_nav = load_price_nav_snapshot()
+
+# -----------------------------
+# SECTION 1: WHAT FUNDS EXIST
+# -----------------------------
+st.subheader("1) ProShares Single Stock ETFs (Top by Net Assets)")
 show_cols = [c for c in ["Ticker", "Fund Name", "Daily Objective", "Net Assets", "Index/Benchmark"] if c in single_stock.columns]
-st.dataframe(single_stock[show_cols], use_container_width=True, hide_index=True)
+st.dataframe(single_stock[show_cols].head(TOP_N), use_container_width=True, hide_index=True)
 
 st.divider()
 
-# ----------------------------
-# Price/NAV “Premium/Discount” answers
-# ----------------------------
-st.subheader("2) Price vs NAV (Premium/Discount) — what this answers")
+# -----------------------------
+# SECTION 2: PRICE vs NAV (SHOWCASE)
+# -----------------------------
+st.subheader("2) Price vs NAV (Premium/Discount + Bid/Ask Spread)")
 
-if not price_nav.empty and "Ticker" in price_nav.columns:
+if price_nav.empty or "Ticker" not in price_nav.columns:
+    st.warning("Could not parse the ProShares Price/NAV table right now. Performance section below still works.")
+else:
     pn = price_nav.copy()
-
-    # Keep only tickers we’re charting (top N single stock)
     pn["Ticker"] = pn["Ticker"].astype(str).str.strip()
     pn = pn[pn["Ticker"].isin(tickers)].copy()
 
-    # Find a likely Market Price column + NAV column (names vary)
-    cols_lower = {c: c.lower() for c in pn.columns}
-
-    price_col = None
+    # Detect likely columns (these exist on the page)
+    # Example header includes: Market Price (Change), NAV (Change), 30 day bid / ask spread, Premium / Discount
+    colmap = {c.lower(): c for c in pn.columns}
+    market_col = None
     nav_col = None
+    spread_col = None
+    prem_col = None
 
-    # Prefer quarter-end if present
     for c in pn.columns:
-        lc = cols_lower[c]
-        if price_col is None and ("market price" in lc or (("price" in lc) and ("market" in lc))):
-            price_col = c
-        if nav_col is None and "nav" in lc:
+        lc = c.lower()
+        if market_col is None and "market price" in lc:
+            market_col = c
+        if nav_col is None and lc == "nav (change)" or ("nav" in lc and nav_col is None):
             nav_col = c
+        if spread_col is None and "bid / ask" in lc:
+            spread_col = c
+        if prem_col is None and "premium" in lc:
+            prem_col = c
 
-    # If still not found, just try common patterns
-    if price_col is None:
-        for c in pn.columns:
-            if "Price" in c or "Market" in c:
-                price_col = c
-                break
-    if nav_col is None:
-        for c in pn.columns:
-            if "NAV" in c:
-                nav_col = c
-                break
-
-    if price_col and nav_col:
-        def to_num(x):
-            return pd.to_numeric(
-                str(x).replace("$", "").replace(",", "").strip(),
-                errors="coerce"
-            )
-
-        pn["Market Price"] = pn[price_col].map(to_num)
-        pn["NAV"] = pn[nav_col].map(to_num)
-        pn["Premium/Discount"] = (pn["Market Price"] - pn["NAV"]) / pn["NAV"]
-
-        # Key answers
-        pn_valid = pn.dropna(subset=["Premium/Discount"]).copy()
-        if not pn_valid.empty:
-            biggest_premium = pn_valid.sort_values("Premium/Discount", ascending=False).iloc[0]
-            biggest_discount = pn_valid.sort_values("Premium/Discount", ascending=True).iloc[0]
-
-            a, b = st.columns(2)
-            a.metric("Largest Premium vs NAV", biggest_premium["Ticker"], f"{biggest_premium['Premium/Discount']:.2%}")
-            b.metric("Largest Discount vs NAV", biggest_discount["Ticker"], f"{biggest_discount['Premium/Discount']:.2%}")
-
-            # Clean table
-            out = pn_valid[["Ticker", "Market Price", "NAV", "Premium/Discount"]].copy()
-            out["Market Price"] = out["Market Price"].map(lambda v: f"${v:,.2f}")
-            out["NAV"] = out["NAV"].map(lambda v: f"${v:,.2f}")
-            out["Premium/Discount"] = out["Premium/Discount"].map(lambda v: f"{v:.2%}")
-
-            st.dataframe(out, use_container_width=True, hide_index=True)
-        else:
-            st.info("Price/NAV parsed, but premium/discount could not be computed for these tickers.")
+    if market_col is None or nav_col is None or prem_col is None:
+        st.warning("Price/NAV columns changed on the website. We loaded the table but couldn't detect the key columns.")
     else:
-        st.info("Price/NAV table loaded, but the exact Price and NAV columns weren’t detected.")
-else:
-    st.info("Price/NAV table not available right now, but the performance section below still works.")
+        pn_out = pd.DataFrame({
+            "Ticker": pn["Ticker"],
+            "Fund Name": pn["Fund Name"] if "Fund Name" in pn.columns else "",
+            "Market Price": pn[market_col].map(_to_number),
+            "NAV": pn[nav_col].map(_to_number),
+            "30D Bid/Ask Spread (%)": pn[spread_col].map(_to_number) if spread_col else np.nan,
+            "Premium/Discount (%)": pn[prem_col].map(_to_number),
+        }).dropna(subset=["Ticker"])
+
+        # Convert percent columns (if already in % units, keep as percent)
+        # Premium/Discount comes like "-0.09%" on site -> _to_number gives -0.09 (percent units)
+        # We'll keep it in percent units for display.
+        # Same for spread.
+        # Add “absolute spread” for ranking efficiency
+        pn_out["Abs Premium/Discount (%)"] = pn_out["Premium/Discount (%)"].abs()
+
+        # Key answers (what you can say you built)
+        k1, k2, k3 = st.columns(3)
+        biggest_premium = pn_out.sort_values("Premium/Discount (%)", ascending=False).head(1).iloc[0]
+        biggest_discount = pn_out.sort_values("Premium/Discount (%)", ascending=True).head(1).iloc[0]
+
+        # Tightest spread: smallest 30D spread
+        if pn_out["30D Bid/Ask Spread (%)"].notna().any():
+            tightest = pn_out.sort_values("30D Bid/Ask Spread (%)", ascending=True).head(1).iloc[0]
+            k3.metric("Tightest Bid/Ask Spread", tightest["Ticker"], f"{tightest['30D Bid/Ask Spread (%)']:.2f}%")
+        else:
+            k3.metric("Tightest Bid/Ask Spread", "N/A", "No data")
+
+        k1.metric("Largest Premium vs NAV", biggest_premium["Ticker"], f"{biggest_premium['Premium/Discount (%)']:.2f}%")
+        k2.metric("Largest Discount vs NAV", biggest_discount["Ticker"], f"{biggest_discount['Premium/Discount (%)']:.2f}%")
+
+        # Clean display table
+        display = pn_out[["Ticker", "Market Price", "NAV", "30D Bid/Ask Spread (%)", "Premium/Discount (%)"]].copy()
+        display["Market Price"] = display["Market Price"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "")
+        display["NAV"] = display["NAV"].map(lambda v: f"${v:,.2f}" if pd.notna(v) else "")
+        display["30D Bid/Ask Spread (%)"] = display["30D Bid/Ask Spread (%)"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+        display["Premium/Discount (%)"] = display["Premium/Discount (%)"].map(lambda v: f"{v:.2f}%" if pd.notna(v) else "")
+
+        st.dataframe(display, use_container_width=True, hide_index=True)
 
 st.divider()
 
-# ----------------------------
-# Performance/Risk section (real market history)
-# ----------------------------
-st.subheader("3) Performance & Risk (real price history)")
+# -----------------------------
+# SECTION 3: PERFORMANCE / RISK (REAL HISTORY)
+# -----------------------------
+st.subheader("3) Performance & Risk (Real Price History)")
 
-with st.spinner("Downloading price history for performance/risk..."):
+with st.spinner("Downloading historical prices for performance metrics..."):
     prices = fetch_prices(tickers, start, end)
 
 if prices.empty or prices.shape[0] < 10:
-    st.error("Not enough Yahoo Finance data for these tickers in this date range. Try a wider range.")
+    st.error("Not enough price data for this date range. Try a wider range (example: start 2023-01-01).")
     st.stop()
 
 prices = prices.dropna(axis=1, how="all")
@@ -250,7 +267,7 @@ growth_100 = (1 + rets).cumprod() * 100
 rows = []
 for t in prices.columns:
     total_ret = float(growth_100[t].iloc[-1] / growth_100[t].iloc[0] - 1)
-    vol = annual_volatility(rets[t])
+    vol = annual_vol(rets[t])
     mdd = max_drawdown(prices[t])
     rows.append({"Ticker": t, "Total Return": total_ret, "Volatility (ann.)": vol, "Max Drawdown": mdd})
 
@@ -260,16 +277,18 @@ best = metrics.sort_values("Total Return", ascending=False).iloc[0]
 riskiest = metrics.sort_values("Volatility (ann.)", ascending=False).iloc[0]
 worstdd = metrics.sort_values("Max Drawdown").iloc[0]  # most negative
 
-x1, x2, x3 = st.columns(3)
-x1.metric("Best performer", best["Ticker"], f"{best['Total Return']:.1%}")
-x2.metric("Riskiest (volatility)", riskiest["Ticker"], f"{riskiest['Volatility (ann.)']:.1%}")
-x3.metric("Worst drawdown", worstdd["Ticker"], f"{worstdd['Max Drawdown']:.1%}")
+m1, m2, m3 = st.columns(3)
+m1.metric("Best Performer", best["Ticker"], f"{best['Total Return']:.1%}")
+m2.metric("Riskiest (Volatility)", riskiest["Ticker"], f"{riskiest['Volatility (ann.)']:.1%}")
+m3.metric("Worst Drawdown", worstdd["Ticker"], f"{worstdd['Max Drawdown']:.1%}")
 
-st.subheader("Growth of $100 (real prices)")
+# Chart answers: “How have these moved over time?”
+st.subheader("Growth of $100")
 st.line_chart(growth_100, use_container_width=True)
 
+# Download button for recruiter/interview
 st.download_button(
-    "Download performance metrics CSV",
+    "Download Performance Metrics CSV",
     data=metrics.to_csv(index=False).encode("utf-8"),
     file_name="proshares_single_stock_performance_metrics.csv",
     mime="text/csv",
